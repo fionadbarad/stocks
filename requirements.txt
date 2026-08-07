@@ -1,0 +1,5 @@
+# Intraday momentum screener with macro/geopolitical layer
+yfinance>=0.2.40
+pandas>=2.0
+numpy>=1.24
+feedparser>=6.0    # optional: geopolitical RSS panel; screener runs without it
