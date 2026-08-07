@@ -124,6 +124,18 @@ MACRO_INSTRUMENTS: List[MacroInstrument] = [
 
 BENCHMARK = "^GSPC"  # for computing defense-sector RELATIVE strength
 
+
+def scored_instruments() -> List[MacroInstrument]:
+    """The gauges that actually contribute to the stress index.
+
+    `^TNX` carries stress_sign 0 / weight 0 — it is displayed for context but
+    deliberately unscored, because the direction of a yield move is
+    regime-dependent. Anything reporting "breadth out of N" must count THIS
+    list, not `MACRO_INSTRUMENTS`, or it understates the denominator.
+    """
+    return [m for m in MACRO_INSTRUMENTS if m.stress_sign != 0 and m.weight > 0]
+
+
 # Categories for classifying broad headlines. Keyword matching is crude; these
 # are used for LABELLING and grouping only, never for directional inference.
 GEO_CATEGORIES: Dict[str, List[str]] = {
@@ -435,6 +447,73 @@ def classify_headline(title: str) -> List[str]:
     return [cat for cat, pat in _CATEGORY_PATTERNS.items() if pat.search(title)]
 
 
+def build_relevance_matcher(
+    ticker: str, company_name: str = ""
+) -> Tuple[Optional[re.Pattern], Optional[re.Pattern]]:
+    """Build the (symbol, company-name) patterns used to test ticker relevance.
+
+    WHY NOT `needle in title.lower()`: plain substring matching is catastrophic
+    for short symbols, and this universe is full of them. Measured on live
+    headlines, the symbol "ON" matched 3 of 4 unrelated titles (every headline
+    containing the word "on"), and "C" matched any headline containing the
+    letter c. Because the relevance filter is what gates the catalyst flag, that
+    silently halved position size on Citigroup, ON Semi, Deere, MP Materials and
+    every other 1-2 character symbol, on the strength of headlines that never
+    mentioned them.
+
+    Two patterns, matched differently:
+
+      SYMBOL — word-boundary AND case-SENSITIVE. Tickers are written in caps in
+      headlines ("C shares fall", "NVDA guides higher"), so requiring caps costs
+      almost no recall and is what separates the symbol "ON" from the preposition
+      "on". This is the check that makes short symbols usable at all.
+
+      COMPANY NAME — word-boundary, case-INSENSITIVE. Prose capitalisation of a
+      company name is inconsistent, and the name is long enough that boundaries
+      alone are sufficient.
+    """
+    sym = (ticker or "").strip()
+    sym_pat = (
+        re.compile(rf"(?<![A-Za-z0-9]){re.escape(sym)}(?![A-Za-z0-9])")
+        if sym else None
+    )
+
+    name_needles: List[str] = []
+    if company_name:
+        base = re.sub(
+            r"\b(inc|corp|corporation|co|ltd|plc|holdings|group|the|company|sa|nv)\b\.?",
+            "", company_name.lower(),
+        ).strip(" ,.-&")
+        if len(base) >= 3:
+            name_needles.append(base)
+            first = base.split()[0] if base.split() else ""
+            # Only a distinctive first token. "advanced" (AMD) or "general" are
+            # common English words and would reintroduce the false positives
+            # this function exists to remove.
+            if len(first) >= 5 and first != base:
+                name_needles.append(first)
+
+    name_pat = None
+    if name_needles:
+        alts = "|".join(
+            r"[\s\-]+".join(re.escape(w) for w in n.split())
+            for n in sorted(name_needles, key=len, reverse=True)
+        )
+        name_pat = re.compile(rf"\b(?:{alts})\b", re.IGNORECASE)
+    return (sym_pat, name_pat)
+
+
+def is_ticker_relevant(
+    title: str, sym_pat: Optional[re.Pattern], name_pat: Optional[re.Pattern]
+) -> bool:
+    """True if `title` actually mentions the symbol or the company."""
+    if not title:
+        return False
+    if sym_pat is not None and sym_pat.search(title):
+        return True
+    return bool(name_pat is not None and name_pat.search(title))
+
+
 def fetch_ticker_headlines(
     ticker: str, company_name: str = "", max_age_hours: float = 48.0,
     limit: int = 8
@@ -447,7 +526,8 @@ def fetch_ticker_headlines(
     and the catalyst flag becomes meaningless.
 
     We check the symbol and, when known, the company name — including a stripped
-    form, so "DraftKings Inc." also matches "DraftKings".
+    form, so "DraftKings Inc." also matches "DraftKings". See
+    `build_relevance_matcher` for why this is regex-based and not `in`.
     """
     import yfinance as yf
 
@@ -457,17 +537,7 @@ def fetch_ticker_headlines(
     except Exception:  # noqa: BLE001
         return out
 
-    needles = {ticker.lower()}
-    if company_name:
-        base = re.sub(
-            r"\b(inc|corp|corporation|co|ltd|plc|holdings|group|the|company|sa|nv)\b\.?",
-            "", company_name.lower(),
-        ).strip(" ,.-")
-        if len(base) >= 3:
-            needles.add(base)
-            first = base.split()[0]
-            if len(first) >= 4:
-                needles.add(first)
+    sym_pat, name_pat = build_relevance_matcher(ticker, company_name)
 
     now = datetime.now(timezone.utc)
     for it in items:
@@ -495,7 +565,6 @@ def fetch_ticker_headlines(
                 url = v
                 break
 
-        low = title.lower()
         h = Headline(
             title=title,
             source=source or "unknown",
@@ -503,7 +572,7 @@ def fetch_ticker_headlines(
             published=published,
             age_hours=age,
             categories=classify_headline(title),
-            ticker_relevant=any(n in low for n in needles),
+            ticker_relevant=is_ticker_relevant(title, sym_pat, name_pat),
         )
         out.append(h)
 
@@ -635,14 +704,24 @@ def assess_catalyst_risk(
     flag.has_fresh_news = fresh
     very_fresh = math.isfinite(flag.newest_age_hours) and flag.newest_age_hours <= 3.0
 
-    # Is the tape actually reacting? Unknown RVOL is treated as neutral.
-    tape_reacting = (rvol is None) or (math.isfinite(rvol) and rvol >= 1.5)
-    tape_ignoring = (
-        rvol is not None and math.isfinite(rvol) and rvol < 1.2
-    )
+    # Is the tape actually reacting?
+    #
+    # RVOL has THREE states, not two, and the difference matters: a real number,
+    # None (caller did not supply it), and NaN (caller tried and the data was
+    # unusable — thin tape, stale feed, first bar of the session). NaN is the
+    # dangerous one. Testing it with `>= 1.5` and `< 1.2` both return False, so
+    # an earlier version fell through every branch and reported risk_level
+    # "none" with full size on breaking news — failing OPEN, silently, in
+    # exactly the low-data conditions where gap risk is worst.
+    #
+    # Unknown is not the same as calm. Both None and NaN are therefore treated
+    # as "cannot rule out a reaction" and take the conservative path.
+    rvol_known = rvol is not None and math.isfinite(rvol)
+    tape_reacting = (not rvol_known) or rvol >= 1.5
+    tape_ignoring = rvol_known and rvol < 1.2
 
-    if very_fresh and tape_reacting and (flag.n_relevant >= 2 or rvol is None
-                                         or (math.isfinite(rvol) and rvol >= 2.0)):
+    if very_fresh and tape_reacting and (flag.n_relevant >= 2 or not rvol_known
+                                         or rvol >= 2.0):
         flag.risk_level = "high"
         flag.size_multiplier = 0.50
         flag.rr_requirement_multiplier = 1.5
@@ -748,6 +827,49 @@ def run_selftest() -> int:
           "sanctions_trade" in classify_headline("Sanctioned entities added"))
     check("empty title is safe", classify_headline("") == [])
 
+    # --- REGRESSION: substring relevance matching flagged short symbols -------
+    # `needle in title.lower()` made the symbol "ON" match any headline
+    # containing the word "on", and "C" match any headline containing a c.
+    # Because relevance gates the catalyst flag, that halved position size on
+    # real tickers off headlines that never mentioned them.
+    noise = [
+        "Fed signals another rate cut as inflation cools",
+        "Oil prices climb on supply concerns",
+        "Takeaways from the disappointing July jobs report",
+        "Analysts weigh in on the market selloff",
+    ]
+    for tkr, nm in [("C", "Citigroup Inc."), ("ON", "ON Semiconductor Corp"),
+                    ("DE", "Deere & Company"), ("MP", "MP Materials Corp"),
+                    ("MS", "Morgan Stanley"), ("AMD", "Advanced Micro Devices")]:
+        sp, np_ = build_relevance_matcher(tkr, nm)
+        hits = [t for t in noise if is_ticker_relevant(t, sp, np_)]
+        check(f"short symbol {tkr!r} does not match unrelated headlines",
+              not hits, f"matched {hits}")
+
+    # True positives must survive the tightening.
+    for tkr, nm, title in [
+        ("C", "Citigroup Inc.", "C shares slide after guidance cut"),
+        ("C", "Citigroup Inc.", "Citigroup names new CFO"),
+        ("ON", "ON Semiconductor Corp", "ON Semiconductor beats on margins"),
+        ("NVDA", "NVIDIA Corporation", "NVDA guides higher for Q3"),
+        ("NVDA", "NVIDIA Corporation", "Nvidia unveils new accelerator"),
+        ("DKNG", "DraftKings Inc.", "DraftKings misses Q2 estimates"),
+        ("MP", "MP Materials Corp", "MP Materials wins rare earth contract"),
+    ]:
+        sp, np_ = build_relevance_matcher(tkr, nm)
+        check(f"{tkr!r} still matches {title[:34]!r}",
+              is_ticker_relevant(title, sp, np_))
+
+    check("symbol match is case-sensitive (ticker caps, not prose)",
+          not is_ticker_relevant("Turn the lights on now",
+                                 *build_relevance_matcher("ON", "")))
+    check("symbol matches when punctuation-adjacent",
+          is_ticker_relevant("Citigroup (C) upgraded to buy",
+                             *build_relevance_matcher("C", "")))
+    check("no ticker and no name matches nothing",
+          not is_ticker_relevant("Anything at all",
+                                 *build_relevance_matcher("", "")))
+
     # --- Relevance filter ----------------------------------------------------
     now = datetime.now(timezone.utc)
     def h(title, hours, relevant):
@@ -783,6 +905,33 @@ def run_selftest() -> int:
     stale = [h("DraftKings misses Q2 estimates", 40.0, True)]
     check("stale news does not flag",
           assess_catalyst_risk("DKNG", stale, rvol=4.0).risk_level == "none")
+
+    # --- REGRESSION: NaN RVOL fell through every branch and failed OPEN ------
+    # NaN fails both `>= 1.5` and `< 1.2`, so breaking news on a name whose RVOL
+    # could not be computed (thin tape, stale feed, first bar of the session)
+    # was reported as no risk at full size. Unknown is not calm.
+    nan_flag = assess_catalyst_risk("DKNG", fresh, rvol=float("nan"))
+    check("NaN RVOL is treated as unknown, not as a quiet tape",
+          nan_flag.risk_level == "high", nan_flag.risk_level)
+    check("NaN RVOL still cuts size", nan_flag.size_multiplier < 1.0,
+          str(nan_flag.size_multiplier))
+    check("NaN RVOL matches the explicit-unknown (None) path",
+          nan_flag.risk_level == assess_catalyst_risk(
+              "DKNG", fresh, rvol=None).risk_level)
+    check("NaN RVOL does not claim the tape is ignoring the news",
+          not any("not reacting" in w for w in nan_flag.warnings))
+
+    # --- Breadth denominator is derived, not hardcoded -----------------------
+    check("scored gauges exclude unsigned/zero-weight context instruments",
+          all(m.stress_sign != 0 and m.weight > 0 for m in scored_instruments()))
+    check("every scored gauge is a real MACRO_INSTRUMENT",
+          set(m.symbol for m in scored_instruments())
+          <= set(m.symbol for m in MACRO_INSTRUMENTS))
+    check("^TNX is carried for context but never scored",
+          "^TNX" not in [m.symbol for m in scored_instruments()])
+    check("scored weights sum to 1.0",
+          abs(sum(m.weight for m in scored_instruments()) - 1.0) < 1e-9,
+          f"got {sum(m.weight for m in scored_instruments())}")
 
     # --- No directional inference anywhere ----------------------------------
     check("CatalystFlag exposes no direction/sentiment field",
