@@ -138,6 +138,11 @@ class ScreenerConfig:
     atr_stop_buffer: float = 0.25      # stop placed k*ATR below chosen anchor
     min_acceptable_rr: float = 1.5     # flag setups below this
     risk_per_trade_pct: float = 0.5    # % of account risked, for size suggestion
+    # Notional ceiling for the suggested size, as a % of account equity. Risk-
+    # based sizing alone is unbounded: as the stop tightens, share count grows
+    # without limit. 100 = no leverage. Raise ONLY if you actually have margin
+    # and intend to use it.
+    max_notional_pct: float = 100.0
 
     # ---- Fetching -----------------------------------------------------------
     intraday_interval: str = "5m"      # base intraday bar
@@ -244,17 +249,34 @@ def _flatten_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
 
 def _drop_stale_tail(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove trailing bars with zero volume.
+    """Remove trailing REGULAR-HOURS bars with zero volume.
 
     Yahoo frequently appends a still-forming or placeholder bar with volume 0 and
     a flat OHLC. Including it corrupts VWAP, RVOL and the "last price" reading.
+
+    THE REGULAR-HOURS RESTRICTION IS LOAD-BEARING. Yahoo zero-fills the volume
+    of EVERY extended-hours bar (see the premarket note in `compute_factors`),
+    while still returning real prices for them. An unrestricted walk-back
+    therefore does not trim one placeholder bar — it deletes the entire
+    after-hours and premarket session. Measured: 12 premarket bars in, 0 out.
+    That destroys exactly the premarket high/low range this screener goes out of
+    its way to preserve, and it does the most damage when the screener is run
+    before the open, which is when a momentum screen is most useful.
+
+    Zero volume inside 09:30-16:00 is a placeholder. Zero volume outside it is a
+    feed limitation, and the prices attached to it are still real.
     """
     if df.empty or "Volume" not in df.columns:
         return df
     vol = df["Volume"].fillna(0)
-    # Walk back from the end while volume is zero.
+    times = df.index.time
+    # Walk back from the end, trimming only zero-volume bars that fall inside
+    # the regular session; stop at the first extended-hours bar.
     idx = len(df) - 1
-    while idx >= 0 and (vol.iloc[idx] == 0):
+    while idx >= 0:
+        in_rth = REGULAR_OPEN <= times[idx] < REGULAR_CLOSE
+        if not (in_rth and vol.iloc[idx] == 0):
+            break
         idx -= 1
     return df.iloc[: idx + 1]
 
@@ -964,7 +986,10 @@ class RiskPlan:
     target_feasible: bool = True
     feasible_target: float = float("nan")
     rr_feasible: float = float("nan")      # R:R capped to reachable range
-    shares_for_1pct_account: float = float("nan")
+    shares_for_1pct_account: float = float("nan")   # risk-derived, AFTER cap
+    shares_uncapped: float = float("nan")  # what pure risk sizing asked for
+    notional: float = float("nan")         # shares * entry
+    notional_capped: bool = False          # True if the ceiling bound the size
     acceptable: bool = False
     notes: List[str] = field(default_factory=list)
 
@@ -1100,11 +1125,39 @@ def build_risk_plan(
     judge_rr = plan.rr_feasible if math.isfinite(plan.rr_feasible) else plan.rr
     plan.acceptable = bool(math.isfinite(judge_rr) and judge_rr >= cfg.min_acceptable_rr)
 
-    # Position size implied by risking cfg.risk_per_trade_pct of the account.
+    # ---- Position size ------------------------------------------------------
+    # Risk-based sizing answers "how many shares put cfg.risk_per_trade_pct of
+    # the account at risk if the stop fills?" — and on its own it is UNBOUNDED.
+    # Share count scales as 1/stop_distance, so a setup hugging VWAP with a 5c
+    # stop asks for 2,272 shares of a $100 stock: $227k of exposure on a $25k
+    # account, 9x equity, with no warning printed. That number is arithmetically
+    # correct and operationally nonsense — it is unbuyable, and if it were
+    # buyable a single gap through the stop (precisely what the catalyst layer
+    # exists to warn about) would exceed the whole account many times over.
+    #
+    # The stop-distance premise is also weakest exactly when it matters most:
+    # tight stops assume continuous price, and a 5c stop on a delayed feed will
+    # not fill at 5c. So cap the notional and say so.
     dollars_at_risk = account_size * (cfg.risk_per_trade_pct / 100.0)
-    plan.shares_for_1pct_account = math.floor(
-        _safe_div(dollars_at_risk, plan.risk_per_share, 0.0)
-    )
+    raw_shares = math.floor(_safe_div(dollars_at_risk, plan.risk_per_share, 0.0))
+    plan.shares_uncapped = raw_shares
+
+    max_notional = account_size * (cfg.max_notional_pct / 100.0)
+    cap_shares = math.floor(_safe_div(max_notional, plan.entry, 0.0))
+    shares = min(raw_shares, cap_shares)
+    plan.notional_capped = bool(raw_shares > cap_shares)
+    plan.shares_for_1pct_account = shares
+    plan.notional = shares * plan.entry
+
+    if plan.notional_capped:
+        plan.notes.append(
+            f"size capped by notional ceiling: risk sizing asked for "
+            f"{raw_shares:,.0f} sh (${raw_shares * plan.entry:,.0f}, "
+            f"{_fmt(raw_shares * plan.entry / account_size, '.1f')}x account) "
+            f"on a ${_fmt(plan.risk_per_share)}/sh stop — reduced to "
+            f"{shares:,.0f} sh. A stop this tight will not survive slippage; "
+            f"treat the R:R as optimistic."
+        )
 
     if plan.stop_pct > 5.0:
         plan.notes.append(
@@ -1504,6 +1557,33 @@ def results_to_json(results: List[ScreenResult]) -> List[dict]:
         d["plan"] = asdict(r.plan) if r.plan else None
         d["passed_all"] = r.passed_all
         d["timestamp"] = now_market().isoformat()
+
+        # The risk overlay MUST be in the record. `plan.shares_for_1pct_account`
+        # is the pre-overlay number; what you would actually have traded is
+        # `adjusted_shares`, after the macro regime and catalyst multipliers.
+        # Logging only the pre-overlay figure means a later review reconstructs
+        # a position you never took, and cannot tell whether the sizing overlay
+        # helped or hurt — which is the one question a run log exists to answer.
+        d["size_multiplier"] = r.size_multiplier
+        d["adjusted_shares"] = r.adjusted_shares
+        d["required_rr"] = r.required_rr
+        cat = r.catalyst
+        d["catalyst"] = None if cat is None else {
+            "risk_level": cat.risk_level,
+            "n_relevant": cat.n_relevant,
+            "newest_age_hours": cat.newest_age_hours,
+            "categories": list(cat.categories),
+            "size_multiplier": cat.size_multiplier,
+            "rr_requirement_multiplier": cat.rr_requirement_multiplier,
+            "warnings": list(cat.warnings),
+            # Titles + source + link only, matching macro_news.py's policy of
+            # never persisting article bodies.
+            "headlines": [
+                {"title": h.title, "source": h.source, "url": h.url,
+                 "age_hours": h.age_hours, "categories": list(h.categories)}
+                for h in cat.headlines
+            ],
+        }
         out.append(d)
     return out
 
@@ -1722,6 +1802,75 @@ def run_selftest() -> int:
     check("absent premarket reported as unknown, not zero",
           not ff.premarket_available and math.isnan(ff.premarket_volume))
 
+    # --- REGRESSION: position size was unbounded by notional ----------------
+    # Risk sizing scales as 1/stop_distance. A setup hugging VWAP produced 2,272
+    # shares of a $100 stock — $227k, 9x a $25k account — with no note printed.
+    tight = Factors(ticker="TIGHT")
+    tight.last, tight.vwap, tight.swing_low = 100.0, 99.95, 99.90
+    tight.atr_intraday, tight.atr_daily = 0.02, 3.0
+    tight.day_high, tight.day_low, tight.swing_high = 100.2, 99.5, 104.0
+    tp = build_risk_plan(tight, ScreenerConfig(), account_size=25_000.0)
+    check("tight stop no longer implies leveraged size",
+          tp.notional <= 25_000.0 + 1e-6,
+          f"${tp.notional:,.0f} notional on a $25,000 account")
+    check("notional cap is flagged, not applied silently", tp.notional_capped)
+    check("the uncapped request is still recorded for review",
+          tp.shares_uncapped > tp.shares_for_1pct_account,
+          f"{tp.shares_uncapped} vs {tp.shares_for_1pct_account}")
+    check("capping explains itself in the notes",
+          any("capped by notional" in n for n in tp.notes))
+
+    # A normal-width stop must be untouched by the cap.
+    wide = Factors(ticker="WIDE")
+    wide.last, wide.vwap, wide.swing_low = 100.0, 97.0, 96.0
+    wide.atr_intraday, wide.atr_daily = 0.5, 3.0
+    wide.day_high, wide.day_low, wide.swing_high = 101.0, 96.5, 106.0
+    wp = build_risk_plan(wide, ScreenerConfig(), account_size=25_000.0)
+    check("ordinary stop distance is not capped", not wp.notional_capped)
+    check("uncapped size equals risk-derived size",
+          wp.shares_for_1pct_account == wp.shares_uncapped)
+    check("risk-derived size still risks ~the configured %",
+          abs(wp.shares_for_1pct_account * wp.risk_per_share - 125.0) <= 5.0,
+          f"${wp.shares_for_1pct_account * wp.risk_per_share:.2f} vs $125")
+
+    # --- REGRESSION: stale-tail trim deleted the extended session ------------
+    # Yahoo zero-fills extended-hours volume. An unrestricted walk-back removed
+    # every premarket bar, destroying the premarket range the screener reports.
+    # 04:00-09:00 inclusive — entirely before the 09:30 open.
+    pm_idx = pd.date_range("2025-01-06 04:00", periods=11, freq="30min",
+                           tz=MARKET_TZ)
+    pm_only = pd.DataFrame({"Open": 100.0, "High": 101.0, "Low": 99.0,
+                            "Close": 100.5, "Volume": 0.0}, index=pm_idx)
+    check("zero-volume premarket bars are preserved",
+          len(_drop_stale_tail(pm_only)) == len(pm_only),
+          f"{len(pm_only)} in -> {len(_drop_stale_tail(pm_only))} out")
+
+    # ...while a still-forming REGULAR-HOURS placeholder is still trimmed.
+    rth_idx = pd.date_range("2025-01-06 09:30", periods=5, freq="5min",
+                            tz=MARKET_TZ)
+    rth_tail = pd.DataFrame({"Open": 100.0, "High": 101.0, "Low": 99.0,
+                             "Close": 100.5, "Volume": [10.0, 10.0, 10.0, 0.0, 0.0]},
+                            index=rth_idx)
+    check("still-forming regular-hours bars are still trimmed",
+          len(_drop_stale_tail(rth_tail)) == 3,
+          f"got {len(_drop_stale_tail(rth_tail))}")
+
+    # --- REGRESSION: JSON log dropped the risk overlay ------------------------
+    # The pre-overlay share count is not the position you would have taken.
+    rec = ScreenResult(factors=score_factors(
+        compute_factors("TEST", _synthetic_intraday(days=12), _synthetic_daily(),
+                        ScreenerConfig(), "5m"), ScreenerConfig()))
+    rec.plan = build_risk_plan(rec.factors, ScreenerConfig())
+    rec.size_multiplier, rec.adjusted_shares, rec.required_rr = 0.375, 12.0, 2.25
+    js = results_to_json([rec])[0]
+    check("JSON records the applied size multiplier",
+          js.get("size_multiplier") == 0.375)
+    check("JSON records the shares actually implied after the overlay",
+          js.get("adjusted_shares") == 12.0)
+    check("JSON records the raised R:R bar", js.get("required_rr") == 2.25)
+    check("JSON round-trips through the serialiser",
+          json.loads(json.dumps(js, default=str))["ticker"] == "TEST")
+
     # --- Degenerate inputs ---------------------------------------------------
     empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
     bad = compute_factors("EMPTY", empty, empty, ScreenerConfig(), "5m")
@@ -1878,9 +2027,14 @@ def print_macro_panel(regime) -> None:
 
     idx = regime.stress_index
     meter = _bar(idx / 100.0, 20)
+    # Denominator is the number of SCORED gauges, derived rather than hardcoded.
+    # It read "/6" against 7 scored instruments, understating the denominator and
+    # making breadth look stronger than it was — and it would silently drift
+    # again the moment MACRO_INSTRUMENTS changed.
+    n_gauges = len(mn.scored_instruments()) if _HAS_MACRO else 0
     print(f"  MACRO / GEOPOLITICAL STRESS   {meter}  {idx:.1f}/100")
     print(f"  Regime: {regime.stress_label:<38} "
-          f"confirming gauges: {regime.breadth}/6")
+          f"confirming gauges: {regime.breadth}/{n_gauges}")
     if regime.size_multiplier < 1.0:
         print(f"  → position size scaled to {regime.size_multiplier:.0%} "
               f"of normal while this regime persists")
